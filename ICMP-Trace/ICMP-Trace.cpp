@@ -13,30 +13,79 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    
-
-
-  
-
     try {
+
         // Initialize the ICMP_Socket object
         ICMP_Socket icmpSocket;
+        icmpSocket.SetIpAddresses(argv[1]);
 
-
-        // Send an ICMP packet
-        icmpSocket.SetDestAddress(argv[1]);
+        // will need to add udp for dns resolution
 
 
         for (int i = 1; i < 31; i++) {
-            if (icmpSocket.SendICMPPacket() == -1) {
+            if (icmpSocket.SendICMPPacket(false) == -1) {
 			    throw std::runtime_error("Failed to send ICMP packet.");
 		    }
         }
 
-        // Receive and process the ICMP response
-        if (!icmpSocket.ReceiveICMPResponse()) {
-            throw std::runtime_error("Failed to receive ICMP response.");
-        }
+        fd_set readfds;
+        int maxfd = icmpSocket.icmp_sock;
+
+        while (!icmpSocket.traceFinished) {
+
+            FD_ZERO(&readfds);
+            FD_SET(icmpSocket.icmp_sock, &readfds);
+
+            struct timeval tv;
+            if (!icmpSocket.GetTimeouts().empty()) {
+                auto now = std::chrono::steady_clock::now();
+                auto nextTimeout = icmpSocket.GetNextTimeout().first;
+                if (nextTimeout > now) {
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(nextTimeout - now);
+                    tv.tv_sec = duration.count() / 1000000;
+                    tv.tv_usec = duration.count() % 1000000;    
+                }
+                else {
+                    tv.tv_sec = 0;
+                    tv.tv_usec = 0;
+                }
+            }
+            else {
+				tv.tv_sec = 0;
+				tv.tv_usec = 500;
+			}
+
+            int activity = select(maxfd + 1, &readfds, NULL, NULL, &tv);
+
+            if (activity < 0) {
+                std::cerr << "Select error." << std::endl;
+                break;
+            }
+
+            if (activity == 0) {
+                std::cerr << "Select timeout." << std::endl;
+                // Handle timeout
+                if (!icmpSocket.GetTimeouts().empty()) {
+                    auto timedOutProbeInfo = icmpSocket.GetNextTimeout();
+                    icmpSocket.SetRetxSeqNumber(timedOutProbeInfo.second);
+                    icmpSocket.SendICMPPacket(true); 
+                }
+                continue;
+            }
+
+            if (FD_ISSET(icmpSocket.icmp_sock, &readfds)) {
+                // ICMP socket has data
+                if (!icmpSocket.ReceiveICMPResponse()) {
+                    throw std::runtime_error("Failed to receive ICMP response.");
+                }
+            }
+
+            // eventually will need to add udp for dns resolution
+
+			
+		}
+
+      
     }
     catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

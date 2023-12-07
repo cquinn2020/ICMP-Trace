@@ -10,6 +10,7 @@
 * of the original message plus the IP header (as per RFC 792); however,
 * longer replies (e.g., 68 bytes) are possible */
 #define MAX_REPLY_SIZE (IP_HDR_SIZE + ICMP_HDR_SIZE + MAX_ICMP_SIZE)
+#define ICMP_ECHO  (IP_HDR_SIZE + ICMP_HDR_SIZE)
 /* ICMP packet types */
 #define ICMP_ECHO_REPLY 0
 #define ICMP_DEST_UNREACH 3
@@ -17,7 +18,7 @@
 #define ICMP_ECHO_REQUEST 8
 
 
-
+// I think this is no longer needed
 struct ICMPResponse {
 	sockaddr_in sourceAddr; // Source address of the response
 	std::string hostname;   // Resolved hostname from DNS
@@ -53,3 +54,35 @@ public:
 };
 /* now restore the previous packing state */
 #pragma pack (pop) 
+
+
+enum ProbeStatus {
+	SENT, RETRANSMITTED, LOST, RECEIVED, DNS_RESOLVED
+};
+
+
+struct Probe {
+	int ttl;
+	int probeCount;
+	std::chrono::steady_clock::time_point sentTime;
+	std::chrono::steady_clock::time_point receiveTime;
+	std::chrono::milliseconds rtt;
+	std::string ipAddress;
+	std::string dnsName;
+	ProbeStatus status;
+
+	Probe(int ttl) : ttl(ttl), probeCount(1), status(SENT) {}
+};
+
+
+
+struct CompareRTO {
+	bool operator()(const std::pair<std::chrono::steady_clock::time_point, int>& a,
+		const std::pair<std::chrono::steady_clock::time_point, int>& b) {
+		return a.first > b.first;
+	}
+};
+
+using MinHeap = std::priority_queue<std::pair<std::chrono::steady_clock::time_point, int>,
+	std::vector<std::pair<std::chrono::steady_clock::time_point, int>>,
+	CompareRTO>;

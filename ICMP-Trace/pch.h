@@ -19,12 +19,16 @@
 #include <vector>
 #include <string>
 #include <iostream>
-#include <sstream>
 #include <algorithm>
 #include <numeric>
 #include <chrono>
-
+#include <queue>
 #include <iomanip>  // for std::setfill and std::setw
 #include <cctype> // for std::toupper
+#include <random>
+#include <thread>
+
+#include <sys/types.h>
+
 
 #endif //PCH_H

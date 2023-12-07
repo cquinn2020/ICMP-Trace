@@ -8,11 +8,13 @@ void ICMP_Socket::InitializeWinsock() {
         throw std::runtime_error("WSAStartup failed with error: " + std::to_string(result));
     }
 }
+
 ICMP_Socket::ICMP_Socket() {
     InitializeWinsock();
 
     ttl = 1;
     seqNumber = 1;
+    traceFinished = false;
 
     // Raw socket to send ICMP pkts
 	icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -61,7 +63,6 @@ void ICMP_Socket::Create_ICMP_Header() {
     icmpHdr.id = processId;
     icmpHdr.seq = seqNumber;
 
-    printf("ICMP Packet Details:\n\nProcess ID: %d\nType: ICMP_ECHO_REQUEST\nSequence Number: %d", icmpHdr.id, icmpHdr.seq);
 
     icmpHdr.checksum = 0; // Initialize checksum to 0 before calculation
     packet_size = sizeof(ICMPHeader); // Size of the ICMP packet
@@ -75,56 +76,57 @@ void ICMP_Socket::Create_ICMP_Header() {
         exit(-1);
     }
 
-    std::cout << "ttl: " << ttl << std::endl;   
+
+
+
 }
-
-
-
 
 u_short ICMP_Socket::GetProcessId() const {
     return (u_short)GetCurrentProcessId();
 }
 
-void ICMP_Socket::SetDestAddress(const char* destAddress) {
-	DWORD IP = inet_addr(destAddress);
-    if (IP == INADDR_NONE) {
-        if ((destHost = gethostbyname(destAddress)) == NULL) {
-			throw std::runtime_error("Unable to resolve destination address");
-		}
-        else {
-			memcpy((char*)&(destAddr.sin_addr), destHost->h_addr, destHost->h_length);
-		}
-    }
+int ICMP_Socket::SendICMPPacket(bool retransmitting) {
+    if ((retransmitting) && (retxSeqNumber > 0)) {
+		// Retransmit the probe with the given sequence number
+		seqNumber = retxSeqNumber;
+	}
     else {
-        destAddr.sin_addr.S_un.S_addr = IP;
-    }
-    // print the resolved destination IP address
-    std::cout << "Destination IP: " << inet_ntoa(destAddr.sin_addr) << std::endl;
-
-    destAddr.sin_family = AF_INET;
-    destAddr.sin_port = 0;  
-}
-
-int ICMP_Socket::SendICMPPacket() {
+		// Send a new probe
+		retxSeqNumber = seqNumber;
+	}
     // Populate the packet buffer with the IP and ICMP headers
     PopulatePacketBuffer();
-    PrintHeaders();
-
-    std::cout << "\n\nDestination IP address:\n";
-    std::cout << inet_ntoa(destAddr.sin_addr) << std::endl;
-    
+    auto sendTime = std::chrono::steady_clock::now();   
     int bytesSent = sendto(icmp_sock, (char*)sendBuf, packet_size, 0, (sockaddr*)&destAddr, sizeof(destAddr));
 
     if (bytesSent == SOCKET_ERROR) {
         std::cerr << "sendto() failed with error: " << WSAGetLastError() << std::endl;
         return -1;  // Return -1 to indicate an error
     }
-    ttl++;
-    seqNumber++;
+    
+    
+    if (!retransmitting) {
+        Probe newProbe(seqNumber);
+        newProbe.sentTime = sendTime;
+        probes.push_back(newProbe);
+
+        // Insert the probe into the min-heap with a default RTO of 500 ms
+        timeouts.push(std::make_pair(newProbe.sentTime + std::chrono::milliseconds(500), seqNumber));
+		// Increment the TTL and sequence number for the next probe
+		ttl++;
+		seqNumber++;
+    }
+    else {
+        Probe* retxProbe = (Probe*) &probes[retxSeqNumber - 1];
+        retxProbe->probeCount++;
+        retxProbe->sentTime = sendTime;
+        retxProbe->status = RETRANSMITTED;
+        timeouts.push(std::make_pair(retxProbe->sentTime + std::chrono::milliseconds(2000), retxSeqNumber));
+        retransmitting = false;
+    }
 
     return bytesSent;  // Return the number of bytes sent
 }
-
 
 bool ICMP_Socket::ReceiveICMPResponse() {
     sockaddr_in fromAddr;
@@ -138,60 +140,47 @@ bool ICMP_Socket::ReceiveICMPResponse() {
 		return false;
 	}
 
-    if ()
+    if (bytesReceived >= ICMP_ECHO && bytesReceived <= MAX_SIZE) {
+        IPHeader* ipResponseHdr = (IPHeader*)recvBuf;
+        ICMPHeader* icmpResponseHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
 
-
-    //bool ttl_expired = false;
-    //while (!ttl_expired) {
-    //    receivedBytes = recvfrom(icmp_sock, recvBuf, MAX_REPLY_SIZE, 0, (sockaddr*)&fromAddr, &fromAddrLen);
-    //    if (receivedBytes == SOCKET_ERROR) {
-    //        // Handle error case
-    //        std::cerr << "recvfrom() failed with error code: " << WSAGetLastError() << std::endl;
-    //        return false;
-    //    }
-    //    if (receivedBytes > 0) {
-    //        std::cout << "Received " << receivedBytes << " bytes from " << inet_ntoa(fromAddr.sin_addr) << std::endl;
-    //        if (receivedBytes == 56) {
-    //            IPHeader* router_ip_hdr = (IPHeader*)recvBuf;
-    //            ICMPHeader* router_icmp_hdr = (ICMPHeader*)(router_ip_hdr + 1);
-    //            IPHeader* orig_ip_hdr = (IPHeader*)(router_icmp_hdr + 1);
-    //            ICMPHeader* orig_icmp_hdr = (ICMPHeader*)(orig_ip_hdr + 1);
-
-    //            if (router_icmp_hdr->type == ICMP_TTL_EXPIRED)
-    //                std::cout << "TTL Expired" << std::endl;
-    //        }
-    //    }
-    //    else {
-    //        std::cout << "No bytes received" << std::endl;
-    //    }
-    //}
-
-    // Parse the response
-    //ParseICMPResponse(receivedBytes, fromAddr);
+        if (icmpResponseHdr->type == ICMP_ECHO_REPLY) {
+            ProcessEchoResponse(bytesReceived, fromAddr);
+		}
+        else if (icmpResponseHdr->type == ICMP_TTL_EXPIRED) {
+            ProcessTimeExceededMessage(bytesReceived, fromAddr);
+		}
+        else if (icmpResponseHdr->type == ICMP_DEST_UNREACH) {
+			std::cout << "Destination Unreachable" << std::endl;
+		}
+        else {
+			std::cout << "Unknown ICMP type" << std::endl;
+		}
+    }   
     return true;
 }
 
-void ICMP_Socket::ParseICMPResponse(int receivedBytes, sockaddr_in& fromAddr) {
-    // Assuming the first 28 bytes are the IP header and ICMP header
-    IPHeader* ipHdr = (IPHeader*)recvBuf;
-    ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
-
-    // Now extract the original IP header and ICMP header sent by us
-    IPHeader* origIpHdr = (IPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader));
-    ICMPHeader* origIcmpHdr = (ICMPHeader*)(recvBuf + 2 * sizeof(IPHeader) + sizeof(ICMPHeader));
-
-    // Check the ID field of the original ICMP header to match our process ID
-    if (origIcmpHdr->id == GetProcessId()) {
-        // This response is in reply to our probe
-        ICMPResponse response;
-        response.sourceAddr = fromAddr;
-        response.resolved = false; // We haven't resolved the hostname yet
-        responses.push_back(response);
-    }
-    else {
-        // This response is not for our probe, ignore it
-    }
-}
+//void ICMP_Socket::ParseICMPResponse(int receivedBytes, sockaddr_in& fromAddr) {
+//    // Assuming the first 28 bytes are the IP header and ICMP header
+//    IPHeader* ipHdr = (IPHeader*)recvBuf;
+//    ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
+//
+//    // Now extract the original IP header and ICMP header sent by us
+//    IPHeader* origIpHdr = (IPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader));
+//    ICMPHeader* origIcmpHdr = (ICMPHeader*)(recvBuf + 2 * sizeof(IPHeader) + sizeof(ICMPHeader));
+//
+//    // Check the ID field of the original ICMP header to match our process ID
+//    if (origIcmpHdr->id == GetProcessId()) {
+//        // This response is in reply to our probe
+//        ICMPResponse response;
+//        response.sourceAddr = fromAddr;
+//        response.resolved = false; // We haven't resolved the hostname yet
+//        responses.push_back(response);
+//    }
+//    else {
+//        // This response is not for our probe, ignore it
+//    }
+//}
 
 void ICMP_Socket::SetIpAddresses(const char* destAddress) {
     // Resolve the destination address
@@ -206,8 +195,6 @@ void ICMP_Socket::SetIpAddresses(const char* destAddress) {
     }
     destAddr.sin_family = AF_INET;
     destAddr.sin_port = 0;
-    // Print the resolved destination IP address
-    std::cout << "Destination IP: " << inet_ntoa(destAddr.sin_addr) << std::endl;
 
     // Set destination IP address in the IP header
     ipHdr.dest_ip = destAddr.sin_addr.s_addr;
@@ -225,10 +212,7 @@ void ICMP_Socket::SetIpAddresses(const char* destAddress) {
     }
     memcpy(&ipHdr.source_ip, destHost->h_addr, destHost->h_length);
 
-    // Print the source IP address
-    std::cout << "Source IP: " << inet_ntoa(*(struct in_addr*)destHost->h_addr) << std::endl;
 }
-
 
 void ICMP_Socket::PopulatePacketBuffer() {
     // Create the ICMP header
@@ -250,4 +234,63 @@ void ICMP_Socket::PrintHeaders() {
             std::cout << std::endl; // Print four bytes per line
         }
     }
+}
+
+void ICMP_Socket::PrintProbeDetails(const Probe& probe, const sockaddr_in& fromAddr) {
+    std::string ipAddr = inet_ntoa(fromAddr.sin_addr);
+    printf("%d %s %lld ms (%d)\n",
+        probe.ttl,
+        ipAddr.c_str(),
+        probe.rtt.count(),
+        probe.probeCount);
+}
+
+bool ICMP_Socket::ProcessEchoResponse(int receivedBytes, sockaddr_in& fromAddr) {
+
+    IPHeader* ipRcvHdr = (IPHeader*)recvBuf;
+    ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
+
+    // Check the ID field of the original ICMP header to match our process ID
+    if (icmpHdr->id == GetProcessId()) {
+        if (ipRcvHdr->source_ip == ipHdr.dest_ip) {
+            this->traceFinished = true;
+        }
+        auto now = std::chrono::steady_clock::now();
+        int ttlIndex = icmpHdr->seq - 1; // Assuming sequence number starts from 1
+        if (ttlIndex >= 0 && ttlIndex < probes.size()) {
+            probes[ttlIndex].status = RECEIVED;
+            probes[ttlIndex].receiveTime = now;
+            probes[ttlIndex].rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - probes[ttlIndex].sentTime);
+
+            // Print the output
+            PrintProbeDetails(probes[ttlIndex], fromAddr);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool ICMP_Socket::ProcessTimeExceededMessage(int receivedBytes, sockaddr_in& fromAddr) {
+    IPHeader* ipHdr = (IPHeader*)recvBuf;
+    ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
+
+    if (icmpHdr->type == ICMP_TTL_EXPIRED) {
+        IPHeader* origIpHdr = (IPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader));
+        ICMPHeader* origIcmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader) + sizeof(IPHeader));
+
+        if (origIcmpHdr->id == GetProcessId()) {
+            auto now = std::chrono::steady_clock::now();
+            int ttlIndex = origIcmpHdr->seq - 1;
+            if (ttlIndex >= 0 && ttlIndex < probes.size()) {
+                probes[ttlIndex].status = RECEIVED;
+                probes[ttlIndex].receiveTime = now;
+                probes[ttlIndex].rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - probes[ttlIndex].sentTime);
+
+                // Print the output
+                PrintProbeDetails(probes[ttlIndex], fromAddr);
+            }
+            return true;
+        }
+    }
+    return false;
 }

@@ -75,10 +75,6 @@ void ICMP_Socket::Create_ICMP_Header() {
         // Perform any necessary cleanup
         exit(-1);
     }
-
-
-
-
 }
 
 u_short ICMP_Socket::GetProcessId() const {
@@ -86,7 +82,7 @@ u_short ICMP_Socket::GetProcessId() const {
 }
 
 int ICMP_Socket::SendICMPPacket(bool retransmitting) {
-    if ((retransmitting) && (retxSeqNumber > 0)) {
+    if (retransmitting && (retxSeqNumber > 0)) {
 		// Retransmit the probe with the given sequence number
 		seqNumber = retxSeqNumber;
 	}

@@ -135,6 +135,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="DNSQueryBuilder.cpp" />
+    <ClCompile Include="DNSResponseParser.cpp" />
     <ClCompile Include="ICMP-Trace.cpp" />
     <ClCompile Include="ICMP_Socket.cpp" />
     <ClCompile Include="NetworkUtils.cpp" />
@@ -144,12 +146,16 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="UDPClient.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="DNSQueryBuilder.h" />
+    <ClInclude Include="DNSResponseParser.h" />
     <ClInclude Include="ICMP_Socket.h" />
     <ClInclude Include="NetworkUtils.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="UDPClient.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="ICMP-Trace.rc" />

@@ -9,15 +9,17 @@ void ICMP_Socket::InitializeWinsock() {
     }
 }
 
-ICMP_Socket::ICMP_Socket() {
+ICMP_Socket::ICMP_Socket(): udpClient(nullptr)   {
     InitializeWinsock();
-
+    
     ttl = 1;
     seqNumber = 1;
     traceFinished = false;
+    echoResponseFromDest = false;
 
     // Raw socket to send ICMP pkts
 	icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+   
 
     if (icmp_sock == INVALID_SOCKET) {
         // Cleanup Winsock
@@ -25,14 +27,35 @@ ICMP_Socket::ICMP_Socket() {
         throw std::runtime_error("Failed to create ICMP socket with error: " + std::to_string(WSAGetLastError()));
     }
 
+    u_long mode = 1; // Non-zero value sets the socket to non-blocking mode
+    if (ioctlsocket(icmp_sock, FIONBIO, &mode) != NO_ERROR) {
+        throw std::runtime_error("Failed to set non-blocking mode: " + std::to_string(WSAGetLastError()));
+    }
+
+    InitializeUDPClient();
+
 
 }
+
 
 ICMP_Socket::~ICMP_Socket() {
     if (icmp_sock != INVALID_SOCKET) {
         closesocket(icmp_sock);
     }
     WSACleanup();
+    delete udpClient;
+}
+
+std::pair<std::chrono::steady_clock::time_point, int> ICMP_Socket::GetNextTimeout() {
+    auto nextTimeout = timeouts.top();
+    timeouts.pop();  
+    return nextTimeout;
+}
+
+
+void  ICMP_Socket::InitializeUDPClient() {
+	udpClient = new UDPClient();
+    
 }
 
 u_short ICMP_Socket::ComputeChecksum(u_short *sendBuf, int size) {
@@ -86,11 +109,7 @@ int ICMP_Socket::SendICMPPacket(bool retransmitting) {
 		// Retransmit the probe with the given sequence number
 		seqNumber = retxSeqNumber;
 	}
-    else {
-		// Send a new probe
-		retxSeqNumber = seqNumber;
-	}
-    // Populate the packet buffer with the IP and ICMP headers
+
     PopulatePacketBuffer();
     auto sendTime = std::chrono::steady_clock::now();   
     int bytesSent = sendto(icmp_sock, (char*)sendBuf, packet_size, 0, (sockaddr*)&destAddr, sizeof(destAddr));
@@ -113,18 +132,29 @@ int ICMP_Socket::SendICMPPacket(bool retransmitting) {
 		seqNumber++;
     }
     else {
-        Probe* retxProbe = (Probe*) &probes[retxSeqNumber - 1];
+        // Retransmit the probe with the given sequence number
+        seqNumber = retxSeqNumber;
+
+        // Calculate dynamic RTO for retransmission based on neighbors
+        //std::chrono::milliseconds dynamicRTO = CalculateDynamicRTO(retxSeqNumber - 1);
+        std::chrono::milliseconds dynamicRTO =std::chrono::milliseconds(500);
+
+        int rtxIndex = retxSeqNumber - 1;
+        Probe* retxProbe = (Probe*)&probes[rtxIndex];
         retxProbe->probeCount++;
         retxProbe->sentTime = sendTime;
         retxProbe->status = RETRANSMITTED;
-        timeouts.push(std::make_pair(retxProbe->sentTime + std::chrono::milliseconds(2000), retxSeqNumber));
+      
+
+        // Insert the probe into the min-heap with the calculated dynamic RTO
+        timeouts.push(std::make_pair(retxProbe->sentTime + dynamicRTO, retxSeqNumber));
         retransmitting = false;
     }
 
     return bytesSent;  // Return the number of bytes sent
 }
 
-bool ICMP_Socket::ReceiveICMPResponse() {
+ICMP_ResponseInfo ICMP_Socket::ReceiveICMPResponse() {
     sockaddr_in fromAddr;
     int fromAddrLen = sizeof(fromAddr);
 
@@ -133,7 +163,7 @@ bool ICMP_Socket::ReceiveICMPResponse() {
     if (bytesReceived == SOCKET_ERROR) {
 		// Handle error case
         throw std::runtime_error("recvfrom() failed with error code: " + std::to_string(WSAGetLastError()));
-		return false;
+		
 	}
 
     if (bytesReceived >= ICMP_ECHO && bytesReceived <= MAX_SIZE) {
@@ -141,10 +171,12 @@ bool ICMP_Socket::ReceiveICMPResponse() {
         ICMPHeader* icmpResponseHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
 
         if (icmpResponseHdr->type == ICMP_ECHO_REPLY) {
-            ProcessEchoResponse(bytesReceived, fromAddr);
+            ICMP_ResponseInfo resp = ProcessEchoResponse(bytesReceived, fromAddr);
+            return resp;
 		}
         else if (icmpResponseHdr->type == ICMP_TTL_EXPIRED) {
-            ProcessTimeExceededMessage(bytesReceived, fromAddr);
+            ICMP_ResponseInfo timeExcMsg =  ProcessTimeExceededMessage(bytesReceived, fromAddr);
+            return timeExcMsg;
 		}
         else if (icmpResponseHdr->type == ICMP_DEST_UNREACH) {
 			std::cout << "Destination Unreachable" << std::endl;
@@ -153,30 +185,8 @@ bool ICMP_Socket::ReceiveICMPResponse() {
 			std::cout << "Unknown ICMP type" << std::endl;
 		}
     }   
-    return true;
+  
 }
-
-//void ICMP_Socket::ParseICMPResponse(int receivedBytes, sockaddr_in& fromAddr) {
-//    // Assuming the first 28 bytes are the IP header and ICMP header
-//    IPHeader* ipHdr = (IPHeader*)recvBuf;
-//    ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
-//
-//    // Now extract the original IP header and ICMP header sent by us
-//    IPHeader* origIpHdr = (IPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader));
-//    ICMPHeader* origIcmpHdr = (ICMPHeader*)(recvBuf + 2 * sizeof(IPHeader) + sizeof(ICMPHeader));
-//
-//    // Check the ID field of the original ICMP header to match our process ID
-//    if (origIcmpHdr->id == GetProcessId()) {
-//        // This response is in reply to our probe
-//        ICMPResponse response;
-//        response.sourceAddr = fromAddr;
-//        response.resolved = false; // We haven't resolved the hostname yet
-//        responses.push_back(response);
-//    }
-//    else {
-//        // This response is not for our probe, ignore it
-//    }
-//}
 
 void ICMP_Socket::SetIpAddresses(const char* destAddress) {
     // Resolve the destination address
@@ -241,38 +251,62 @@ void ICMP_Socket::PrintProbeDetails(const Probe& probe, const sockaddr_in& fromA
         probe.probeCount);
 }
 
-bool ICMP_Socket::ProcessEchoResponse(int receivedBytes, sockaddr_in& fromAddr) {
+
+ICMP_ResponseInfo ICMP_Socket::ProcessEchoResponse(int receivedBytes, sockaddr_in& fromAddr) {
+    ICMP_ResponseInfo responseInfo; // Create an instance of ResponseInfo
 
     IPHeader* ipRcvHdr = (IPHeader*)recvBuf;
     ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
 
+    // Convert source IP to human-readable format
+    char srcIpStr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(ipRcvHdr->source_ip), srcIpStr, INET_ADDRSTRLEN);
+
     // Check the ID field of the original ICMP header to match our process ID
     if (icmpHdr->id == GetProcessId()) {
+        responseInfo.sequenceNumber = icmpHdr->seq;
+
+        responseInfo.ipAddress = srcIpStr;
+
         if (ipRcvHdr->source_ip == ipHdr.dest_ip) {
-            this->traceFinished = true;
+            this->echoResponseFromDest = true;
         }
+
         auto now = std::chrono::steady_clock::now();
         int ttlIndex = icmpHdr->seq - 1; // Assuming sequence number starts from 1
-        if (ttlIndex >= 0 && ttlIndex < probes.size()) {
-            probes[ttlIndex].status = RECEIVED;
-            probes[ttlIndex].receiveTime = now;
-            probes[ttlIndex].rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - probes[ttlIndex].sentTime);
 
-            // Print the output
-            PrintProbeDetails(probes[ttlIndex], fromAddr);
+        if (ttlIndex >= 0 && ttlIndex < probes.size()) {
+            Probe& responseProbe = probes[ttlIndex];
+            responseProbe.status = RECEIVED;
+            responseProbe.receiveTime = now;
+            responseProbe.rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - responseProbe.sentTime);
+            responseProbe.ipAddress = srcIpStr;
+
         }
-        return true;
     }
-    return false;
+
+    // Return the ResponseInfo structure
+    return responseInfo;
 }
 
-bool ICMP_Socket::ProcessTimeExceededMessage(int receivedBytes, sockaddr_in& fromAddr) {
+ICMP_ResponseInfo ICMP_Socket::ProcessTimeExceededMessage(int receivedBytes, sockaddr_in& fromAddr) {
+    ICMP_ResponseInfo responseInfo; // Create an instance of ICMP_ResponseInfo
+
     IPHeader* ipHdr = (IPHeader*)recvBuf;
     ICMPHeader* icmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader));
+
+    std::cout << "Timeout Exceeded Message" << std::endl;
+
+    // Convert source IP to human-readable format
+    char srcIpStr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(ipHdr->source_ip), srcIpStr, INET_ADDRSTRLEN);
 
     if (icmpHdr->type == ICMP_TTL_EXPIRED) {
         IPHeader* origIpHdr = (IPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader));
         ICMPHeader* origIcmpHdr = (ICMPHeader*)(recvBuf + sizeof(IPHeader) + sizeof(ICMPHeader) + sizeof(IPHeader));
+
+        char strIp[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(origIpHdr->source_ip), strIp, INET_ADDRSTRLEN);
 
         if (origIcmpHdr->id == GetProcessId()) {
             auto now = std::chrono::steady_clock::now();
@@ -281,12 +315,116 @@ bool ICMP_Socket::ProcessTimeExceededMessage(int receivedBytes, sockaddr_in& fro
                 probes[ttlIndex].status = RECEIVED;
                 probes[ttlIndex].receiveTime = now;
                 probes[ttlIndex].rtt = std::chrono::duration_cast<std::chrono::milliseconds>(now - probes[ttlIndex].sentTime);
-
-                // Print the output
-                PrintProbeDetails(probes[ttlIndex], fromAddr);
+                probes[ttlIndex].ipAddress = strIp;
             }
-            return true;
+            // Fill in the responseInfo structure
+            responseInfo.sequenceNumber = origIcmpHdr->seq;
+            responseInfo.ipAddress = strIp;
+            return responseInfo;
         }
     }
-    return false;
+    // Return an empty responseInfo structure if the condition is not met
+    return responseInfo;
+}
+
+
+std::chrono::milliseconds ICMP_Socket::CalculateDynamicRTO(int currentSeqNumber) {
+    // Define default RTO
+    const std::chrono::milliseconds defaultRTO(3000);
+
+    // Check for left and right neighbors
+    int leftNeighborIndex = currentSeqNumber - 2; // -2 because currentSeqNumber is already incremented for the next probe
+    int rightNeighborIndex = currentSeqNumber;
+
+    bool leftNeighborValid = (leftNeighborIndex >= 0 && probes[leftNeighborIndex].status == RECEIVED);
+    bool rightNeighborValid = (rightNeighborIndex < probes.size() && probes[rightNeighborIndex].status == RECEIVED);
+
+
+    //return defaultRTO;
+    if (leftNeighborValid && rightNeighborValid) {
+        // Average RTT of both neighbors
+        auto avgRtt = (probes[leftNeighborIndex].rtt + probes[rightNeighborIndex].rtt) / 2;
+        return avgRtt * 2;
+    }
+    else if (leftNeighborValid) {
+        // Twice the RTT of the left neighbor
+        return probes[leftNeighborIndex].rtt * 2;
+    }
+    else if (rightNeighborValid) {
+        // Three times the RTT of the right neighbor
+        return probes[rightNeighborIndex].rtt * 3;
+    }
+    else {
+        // Default RTO if no valid neighbors
+        return defaultRTO;
+    }
+}
+
+void ICMP_Socket::SendDNSQuery(const std::string& ipAddress, int txId) {
+    std::cout << "Sending DNS query for " << ipAddress << std::endl;
+    // Prepare the DNS query packet using DNSQueryBuilder
+    dnsQueryBuilder.prepareQueryPacket(ipAddress, "168.63.129.16", txId);
+    std::vector<char> packet = dnsQueryBuilder.getConstructedPacket();
+
+    // Send the packet using UDPClient
+    if (!udpClient->sendData(packet)) {
+        throw std::runtime_error("Failed to send DNS query packet.");
+    }
+
+
+    // push new timeout with 5 seconds for dns query
+    timeouts.push(std::make_pair(std::chrono::steady_clock::now() + std::chrono::seconds(5), txId));
+    probes[txId - 1].reinsertCount++;
+}
+
+void ICMP_Socket::HandleTimeout() {
+	// Get the next timeout from the min-heap
+	auto nextTimeout = GetNextTimeout();
+	auto now = std::chrono::steady_clock::now();
+    int seqNumber = nextTimeout.second;
+    auto newRTO = CalculateDynamicRTO(seqNumber);
+
+    auto probeTimeout = probeTimeouts.find(seqNumber);
+    if (probeTimeout != probeTimeouts.end()) {
+        // Check if the probe has timed out more than 3 times
+        int probeIndex = seqNumber - 1;
+        if (probes[probeIndex].probeCount == 3) {
+            probes[probeIndex].status = LOST;
+        }
+        else {
+            // Retransmit the probe
+            int probesIndex = seqNumber - 1;
+            
+            retxSeqNumber = seqNumber;
+            probeTimeouts[seqNumber] = now + newRTO;
+            probes[probesIndex].status = RETRANSMITTED;
+            probes[probesIndex].sentTime = now;
+            probes[probesIndex].probeCount++;
+            timeouts.push(std::make_pair(now + newRTO, seqNumber));
+            
+            SendICMPPacket(true);
+        }
+    }
+
+}   
+
+void ICMP_Socket::UpdateProbeDNSInfo(int seqNumber, const std::string& dnsName, bool dnsResolved) {
+    // Access and update the DNS-related information for a specific Probe
+
+    // Ensure seqNumber is within valid range
+    if (seqNumber >= 1 && seqNumber <= probes.size()) {
+        Probe& probe = probes[seqNumber - 1];
+        probe.dnsName = dnsName;  // Update the DNS name
+        probe.dnsQuerySent = dnsResolved;  // Update the DNS resolution status
+
+        if (dnsResolved) {
+			probe.status = DNS_RESOLVED;
+		}
+        std::cout << "DNS resolved for probe " << seqNumber << std::endl;
+        std::cout << "DNS name: " << dnsName << std::endl;
+        std::cout << "Number of probes: " << probes.size() << std::endl;
+	}
+	else {
+		std::cerr << "Invalid sequence number." << std::endl;
+    }
 }

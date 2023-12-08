@@ -27,8 +27,8 @@
 #include <cctype> // for std::toupper
 #include <random>
 #include <thread>
-
+#include <sstream>
 #include <sys/types.h>
-
+#include <unordered_map>
 
 #endif //PCH_H
